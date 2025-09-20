@@ -638,6 +638,18 @@ impl QueryPager {
         )
     }
 
+    /// This is essentially the same as `next()`, but it is *public* and only available
+    /// when the `csharp-rs-unstable` feature is enabled.
+    /// Rationale: I don't know a way to make a function conditionally public,
+    /// based on a compile-time flag, so I added an new wrapper function
+    /// that is conditionally compiled and is public.
+    #[cfg(csharp_rs_unstable)]
+    pub async fn next_column_iterator(
+        &mut self,
+    ) -> Option<Result<ColumnIterator<'_, '_>, NextRowError>> {
+        self.next().await
+    }
+
     /// Tries to acquire a non-empty page, if current page is exhausted.
     fn poll_fill_page(
         mut self: Pin<&mut Self>,
