@@ -202,6 +202,8 @@ pub mod serialize {
             CellOverflowError, CellValueBuilder, CellWriter, RowWriter, WrittenCellProof,
         };
     }
+
+    pub mod value_serializer;
 }
 
 pub mod deserialize {
