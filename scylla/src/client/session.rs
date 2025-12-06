@@ -41,6 +41,7 @@ use crate::statement::batch::{Batch, BatchStatement};
 use crate::statement::prepared::{PartitionKeyError, PreparedStatement};
 use crate::statement::unprepared::Statement;
 use crate::statement::{Consistency, PageSize, StatementConfig};
+use crate::serialize::value_serializer::{ValuesSerializationSupplier, NonConsumingSupplier, SerializesValuesBorrowed, ConsumingSupplier, SerializesValuesOwned, PreSerializedSupplier};
 use arc_swap::ArcSwapOption;
 use futures::future::join_all;
 use futures::future::try_join_all;
@@ -59,6 +60,7 @@ use tokio::time::timeout;
 use tracing::warn;
 use tracing::{Instrument, debug, error, trace, trace_span};
 use uuid::Uuid;
+use scylla_cql::_macro_internal::{RowSerializationContext, RowWriter, SerializationError};
 
 pub(crate) const TABLET_CHANNEL_SIZE: usize = 8192;
 
@@ -505,13 +507,16 @@ impl Session {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn query_unpaged(
+    pub async fn query_unpaged<T: SerializeRow>(
         &self,
         statement: impl Into<Statement>,
-        values: impl SerializeRow,
+        values: T,
     ) -> Result<QueryResult, ExecutionError> {
-        self.do_query_unpaged(&statement.into(), values).await
+        let stmt = statement.into();
+        let supplier = ValuesSerializationSupplier::new(values);
+        self.do_query_unpaged::<T, _>(&stmt, supplier).await
     }
+
 
     /// Queries a single page from the database, optionally continuing from a saved point.
     ///
@@ -615,7 +620,8 @@ impl Session {
         statement: impl Into<Statement>,
         values: impl SerializeRow,
     ) -> Result<QueryPager, PagerExecutionError> {
-        self.do_query_iter(statement.into(), values).await
+        let supplier = ValuesSerializationSupplier::new(values);
+        self.do_query_iter(statement.into(), supplier).await
     }
 
     /// Execute a prepared statement. Requires a [PreparedStatement]
@@ -666,7 +672,8 @@ impl Session {
         prepared: &PreparedStatement,
         values: impl SerializeRow,
     ) -> Result<QueryResult, ExecutionError> {
-        self.do_execute_unpaged(prepared, values).await
+        let supplier = ValuesSerializationSupplier::new(values);
+        self.do_execute_unpaged(prepared, supplier).await
     }
 
     /// Executes a prepared statement, restricting results to single page.
@@ -725,15 +732,16 @@ impl Session {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn execute_single_page(
+    pub async fn execute_single_page<T: SerializeRow>(
         &self,
         prepared: &PreparedStatement,
-        values: impl SerializeRow,
+        values: T,
         paging_state: PagingState,
     ) -> Result<(QueryResult, PagingStateResponse), ExecutionError> {
-        self.do_execute_single_page(prepared, values, paging_state)
-            .await
+        let supplier = ValuesSerializationSupplier::new(values);
+        self.do_execute_single_page::<T, _>(prepared, supplier, paging_state).await
     }
+
 
     /// Execute a prepared statement with paging.\
     /// This method will query all pages of the result.\
@@ -779,8 +787,10 @@ impl Session {
         prepared: impl Into<PreparedStatement>,
         values: impl SerializeRow,
     ) -> Result<QueryPager, PagerExecutionError> {
-        self.do_execute_iter(prepared.into(), values).await
+        let supplier = ValuesSerializationSupplier::new(values);
+        self.do_execute_iter(prepared.into(), supplier).await
     }
+
 
     /// Execute a batch statement\
     /// Batch contains many `unprepared` or `prepared` statements which are executed at once\
@@ -1009,24 +1019,37 @@ impl Session {
         Ok(session)
     }
 
-    async fn do_query_unpaged(
+    async fn do_query_unpaged<T, S>(
         &self,
         statement: &Statement,
-        values: impl SerializeRow,
-    ) -> Result<QueryResult, ExecutionError> {
+        supplier: S,
+    ) -> Result<QueryResult, ExecutionError>
+    where
+        T: SerializeRow,
+        S: NonConsumingSupplier<T>,
+    {
         let (result, paging_state_response) = self
-            .query(statement, values, None, PagingState::start())
+            .query::<T, S>(
+                statement,
+                supplier,
+                None,                 // unpaged
+                PagingState::start(), // no incoming paging state
+            )
             .await?;
+
         if !paging_state_response.finished() {
             error!(
-                "Unpaged unprepared query returned a non-empty paging state! This is a driver-side or server-side bug."
-            );
+            "Unpaged unprepared query returned a non-empty paging state! \
+             This is a driver-side or server-side bug."
+        );
             return Err(ExecutionError::LastAttemptError(
                 RequestAttemptError::NonfinishedPagingState,
             ));
         }
+
         Ok(result)
     }
+
 
     async fn do_query_single_page(
         &self,
@@ -1036,7 +1059,7 @@ impl Session {
     ) -> Result<(QueryResult, PagingStateResponse), ExecutionError> {
         self.query(
             statement,
-            values,
+            ValuesSerializationSupplier::new(&values),
             Some(statement.get_validated_page_size()),
             paging_state,
         )
@@ -1054,13 +1077,17 @@ impl Session {
     /// that we need to require users to make a conscious decision to use paging or not. For that, we expose
     /// the aforementioned 3 methods clearly differing in naming and API, so that no unconscious choices about paging
     /// should be made.
-    async fn query(
+    pub async fn query<T, S>(
         &self,
         statement: &Statement,
-        values: impl SerializeRow,
+        supplier: S,
         page_size: Option<PageSize>,
         paging_state: PagingState,
-    ) -> Result<(QueryResult, PagingStateResponse), ExecutionError> {
+    ) -> Result<(QueryResult, PagingStateResponse), ExecutionError>
+    where
+        T: SerializeRow,
+        S: NonConsumingSupplier<T>,
+    {
         let execution_profile = statement
             .get_execution_profile_handle()
             .unwrap_or_else(|| self.get_default_execution_profile_handle())
@@ -1080,10 +1107,11 @@ impl Session {
 
         let span = RequestSpan::new_query(&statement.contents);
         let span_ref = &span;
-        let (run_request_result, coordinator): (
-            RunRequestResult<NonErrorQueryResponse>,
-            Coordinator,
-        ) = self
+
+        let supplier_ref = &supplier;
+        let paging_state_ref = &paging_state;
+
+        let (run_request_result, coordinator) = self
             .run_request(
                 statement_info,
                 &statement.config,
@@ -1095,41 +1123,48 @@ impl Session {
                         .config
                         .serial_consistency
                         .unwrap_or(execution_profile.serial_consistency);
-                    // Needed to avoid moving query and values into async move block
-                    let values_ref = &values;
-                    let paging_state_ref = &paging_state;
+
+                    let paging_state_local = paging_state_ref.clone();
+
                     async move {
-                        if values_ref.is_empty() {
+                        if supplier_ref.is_empty() {
                             span_ref.record_request_size(0);
+
                             connection
                                 .query_raw_with_consistency(
                                     statement,
                                     consistency,
                                     serial_consistency,
                                     page_size,
-                                    paging_state_ref.clone(),
+                                    paging_state_local,
                                 )
                                 .await
                                 .and_then(QueryResponse::into_non_error_query_response)
                         } else {
                             let prepared = connection.prepare(statement).await?;
-                            let serialized = prepared.serialize_values(values_ref)?;
+
+                            // Borrowed path: serialize immediately for THIS retry attempt
+                            let serializer =
+                                supplier_ref.for_prepared_borrow(&prepared)?;
+                            let serialized = serializer.as_serialized();
+
                             span_ref.record_request_size(serialized.buffer_size());
+
                             connection
                                 .execute_raw_with_consistency(
                                     &prepared,
-                                    &serialized,
+                                    serialized,
                                     consistency,
                                     serial_consistency,
                                     page_size,
-                                    paging_state_ref.clone(),
+                                    paging_state_local,
                                 )
                                 .await
                                 .and_then(QueryResponse::into_non_error_query_response)
                         }
                     }
                 },
-                &span,
+                span_ref,
             )
             .instrument(span.span().clone())
             .await?;
@@ -1147,10 +1182,12 @@ impl Session {
 
         let (result, paging_state_response) =
             response.into_query_result_and_paging_state(coordinator)?;
+
         span.record_result_fields(&result);
 
         Ok((result, paging_state_response))
     }
+
 
     async fn handle_set_keyspace_response(
         &self,
@@ -1189,44 +1226,50 @@ impl Session {
         Ok(())
     }
 
-    async fn do_query_iter(
+    pub async fn do_query_iter<T, S>(
         &self,
         statement: Statement,
-        values: impl SerializeRow,
-    ) -> Result<QueryPager, PagerExecutionError> {
+        supplier: S,
+    ) -> Result<QueryPager, PagerExecutionError>
+    where
+        T: SerializeRow,
+        S: ConsumingSupplier<T>,
+    {
         let execution_profile = statement
             .get_execution_profile_handle()
             .unwrap_or_else(|| self.get_default_execution_profile_handle())
             .access();
 
-        if values.is_empty() {
-            QueryPager::new_for_query(
+        if supplier.is_empty() {
+            return QueryPager::new_for_query(
                 statement,
                 execution_profile,
                 self.cluster.get_state(),
                 #[cfg(feature = "metrics")]
                 Arc::clone(&self.metrics),
             )
-            .await
-            .map_err(PagerExecutionError::NextPageError)
-        } else {
-            // Making QueryPager::new_for_query work with values is too hard (if even possible)
-            // so instead of sending one prepare to a specific connection on each iterator query,
-            // we fully prepare a statement beforehand.
-            let prepared = self.prepare_nongeneric(&statement).await?;
-            let values = prepared.serialize_values(&values)?;
-            QueryPager::new_for_prepared_statement(PreparedPagerConfig {
-                prepared,
-                values,
-                execution_profile,
-                cluster_state: self.cluster.get_state(),
-                #[cfg(feature = "metrics")]
-                metrics: Arc::clone(&self.metrics),
-            })
-            .await
-            .map_err(PagerExecutionError::NextPageError)
+                .await
+                .map_err(PagerExecutionError::NextPageError);
         }
+
+        let prepared = self.prepare_nongeneric(&statement).await?;
+
+        // Consuming path: move supplier → build owned serializer → serialize when requested
+        let serializer = supplier.into_owned_serializer(&prepared)?;
+        let serialized = serializer.into_serialized()?; // no cloning
+
+        QueryPager::new_for_prepared_statement(PreparedPagerConfig {
+            prepared,
+            values: serialized,
+            execution_profile,
+            cluster_state: self.cluster.get_state(),
+            #[cfg(feature = "metrics")]
+            metrics: Arc::clone(&self.metrics),
+        })
+            .await
+            .map_err(PagerExecutionError::NextPageError)
     }
+
 
     /// Prepares a statement on the server side and returns a prepared statement,
     /// which can later be used to perform more efficient requests.
@@ -1384,37 +1427,59 @@ impl Session {
             .as_deref()
     }
 
-    async fn do_execute_unpaged(
+    pub async fn do_execute_unpaged<T, S>(
         &self,
         prepared: &PreparedStatement,
-        values: impl SerializeRow,
-    ) -> Result<QueryResult, ExecutionError> {
-        let serialized_values = prepared.serialize_values(&values)?;
+        supplier: S,
+    ) -> Result<QueryResult, ExecutionError>
+    where
+        T: SerializeRow,
+        S: ConsumingSupplier<T>,
+    {
+        let serializer = supplier.into_owned_serializer(prepared)?;
+        let serialized_values = serializer.into_serialized()?; // moved, no clone
+
         let (result, paging_state) = self
             .execute(prepared, &serialized_values, None, PagingState::start())
             .await?;
+
         if !paging_state.finished() {
             error!(
-                "Unpaged prepared query returned a non-empty paging state! This is a driver-side or server-side bug."
-            );
+            "Unpaged prepared query returned a non-empty paging state! \
+             This is a driver-side or server-side bug."
+        );
             return Err(ExecutionError::LastAttemptError(
                 RequestAttemptError::NonfinishedPagingState,
             ));
         }
+
         Ok(result)
     }
 
-    async fn do_execute_single_page(
+
+    async fn do_execute_single_page<T, S>(
         &self,
         prepared: &PreparedStatement,
-        values: impl SerializeRow,
+        supplier: S,
         paging_state: PagingState,
-    ) -> Result<(QueryResult, PagingStateResponse), ExecutionError> {
-        let serialized_values = prepared.serialize_values(&values)?;
+    ) -> Result<(QueryResult, PagingStateResponse), ExecutionError>
+    where
+        T: SerializeRow,
+        S: ConsumingSupplier<T>,
+    {
+        let serializer = supplier.into_owned_serializer(prepared)?;
+        let serialized_values = serializer.into_serialized()?;
+
         let page_size = prepared.get_validated_page_size();
-        self.execute(prepared, &serialized_values, Some(page_size), paging_state)
+        self.execute(
+            prepared,
+            &serialized_values,
+            Some(page_size),
+            paging_state,
+        )
             .await
     }
+
 
     /// Sends a prepared request to the database, optionally continuing from a saved point.
     ///
@@ -1530,12 +1595,18 @@ impl Session {
         Ok((result, paging_state_response))
     }
 
-    async fn do_execute_iter(
+    pub async fn do_execute_iter<T, S>(
         &self,
         prepared: PreparedStatement,
-        values: impl SerializeRow,
-    ) -> Result<QueryPager, PagerExecutionError> {
-        let serialized_values = prepared.serialize_values(&values)?;
+        supplier: S,
+    ) -> Result<QueryPager, PagerExecutionError>
+    where
+        T: SerializeRow,
+        S: ConsumingSupplier<T>,
+    {
+        let serialized_values = supplier
+            .into_owned_serializer(&prepared)?
+            .into_serialized()?; // MOVE — zero-copy for pre-serialized values
 
         let execution_profile = prepared
             .get_execution_profile_handle()
@@ -1550,9 +1621,10 @@ impl Session {
             #[cfg(feature = "metrics")]
             metrics: Arc::clone(&self.metrics),
         })
-        .await
-        .map_err(PagerExecutionError::NextPageError)
+            .await
+            .map_err(PagerExecutionError::NextPageError)
     }
+
 
     async fn do_batch(
         &self,
@@ -1834,8 +1906,14 @@ impl Session {
         traces_events_query.set_page_size(TRACING_QUERY_PAGE_SIZE);
 
         let (traces_session_res, traces_events_res) = tokio::try_join!(
-            self.do_query_unpaged(&traces_session_query, (tracing_id,)),
-            self.do_query_unpaged(&traces_events_query, (tracing_id,))
+            self.do_query_unpaged::<(Uuid,), _>(
+                &traces_session_query,
+                ValuesSerializationSupplier::new((*tracing_id,))
+            ),
+            self.do_query_unpaged::<(Uuid,), _>(
+                &traces_events_query,
+                ValuesSerializationSupplier::new((*tracing_id,))
+            )
         )?;
 
         // Get tracing info
@@ -2452,4 +2530,72 @@ impl ExecuteRequestContext<'_> {
 enum SchemaNodeResult {
     Success(Uuid),
     BrokenConnection(BrokenConnectionError),
+}
+
+// interoperability section
+
+#[derive(Debug, Clone, Copy)]
+pub struct NoValues;
+
+impl SerializeRow for NoValues {
+    fn serialize(
+        &self,
+        _ctx: &RowSerializationContext<'_>,
+        _writer: &mut RowWriter,
+    ) -> Result<(), SerializationError> {
+        // No values to write
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        true
+    }
+}
+impl Session {
+    pub async fn query_iter_interop(
+        &self,
+        statement: impl Into<Statement>,
+        pre_serialized: SerializedValues,
+    ) -> Result<QueryPager, PagerExecutionError> {
+        let supplier = PreSerializedSupplier::new(pre_serialized);
+        self.do_query_iter::<NoValues, _>(statement.into(), supplier).await
+    }
+
+    pub async fn query_unpaged_interop(
+        &self,
+        statement: impl Into<Statement>,
+        pre_serialized: SerializedValues,
+    ) -> Result<QueryResult, ExecutionError> {
+        let supplier = PreSerializedSupplier::new(pre_serialized);
+        self.do_query_unpaged::<NoValues, _>(&statement.into(), supplier).await
+    }
+
+    pub async fn execute_unpaged_interop(
+        &self,
+        prepared: &PreparedStatement,
+        values: impl SerializeRow,
+    ) -> Result<QueryResult, ExecutionError> {
+        let supplier = ValuesSerializationSupplier::new(values);
+        self.do_execute_unpaged(prepared, supplier).await
+    }
+
+    pub async fn execute_single_page_interop(
+        &self,
+        prepared: &PreparedStatement,
+        pre_serialized: SerializedValues,
+        paging_state: PagingState,
+    ) -> Result<(QueryResult, PagingStateResponse), ExecutionError> {
+        let supplier = PreSerializedSupplier::new(pre_serialized);
+        self.do_execute_single_page::<NoValues, _>(prepared, supplier, paging_state).await
+    }
+
+    pub async fn execute_iter_interop(
+        &self,
+        prepared: impl Into<PreparedStatement>,
+        pre_serialized: SerializedValues,
+    ) -> Result<QueryPager, PagerExecutionError> {
+        let supplier = PreSerializedSupplier::new(pre_serialized);
+        self.do_execute_iter::<NoValues, _>(prepared.into(), supplier).await
+    }
+
 }
