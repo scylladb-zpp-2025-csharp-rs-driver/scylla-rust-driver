@@ -174,6 +174,9 @@ pub mod serialize {
         // Main types
         pub use scylla_cql::serialize::row::{RowSerializationContext, SerializeRow};
 
+        // Necessary for external serialization used in interop-oriented C# drivers
+        pub use scylla_cql::serialize::row::SerializedValues;
+
         // Errors
         pub use scylla_cql::serialize::row::{
             BuiltinSerializationError, BuiltinSerializationErrorKind, BuiltinTypeCheckError,
